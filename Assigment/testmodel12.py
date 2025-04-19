@@ -30,7 +30,7 @@ class Agent:
         self.reset()
         # Use shared Q-table if provided, otherwise create individual Q-table
         self.q_table = shared_q if shared_q is not None else {}
-        self.epsilon = 0.1
+        self.epsilon = 0.2
         self.alpha = 0.1
         self.gamma = 0.99
         self.rewards_log = []
@@ -39,6 +39,11 @@ class Agent:
         """Sets initial position and carrying status for off-the-job training."""
         self.pos = A_LOCATION if self.idx % 2 == 0 else B_LOCATION
         self.carrying = self.pos == A_LOCATION
+
+    def reset_at_b(self):
+        """Reset agent to start at B for performance evaluation."""
+        self.pos = B_LOCATION
+        self.carrying = False  # Not carrying when starting at B
 
     def get_neighbors_state(self, grid, agents):
         """
@@ -63,9 +68,9 @@ class Agent:
         neighbors = self.get_neighbors_state(grid, agents)
         return (self.pos[0], self.pos[1], int(self.carrying), neighbors)
 
-    def choose_action(self, grid, agents):
+    def choose_action(self, grid, agents, eval_mode=False):
         state = self.get_state(grid, agents)
-        if random.random() < self.epsilon or state not in self.q_table:
+        if not eval_mode and random.random() < self.epsilon or state not in self.q_table:
             return random.randint(0, 3)
         return int(np.argmax(self.q_table[state]))
 
@@ -171,6 +176,81 @@ print(f"Training completed: Episodes={episode}, Steps={total_steps}, Collisions=
 with open("q_tables.pkl", "wb") as f:
     pickle.dump([shared_q_table], f)  # Save only the shared Q-table
 
+# Performance Evaluation Function
+def evaluate_performance(num_trials=100, max_steps=25):
+    """
+    Evaluates agent performance starting at B.
+    Success criteria: Complete delivery (B→A→B) within max_steps steps without collisions.
+    Returns success rate.
+    """
+    print(f"\nEvaluating final performance over {num_trials} trials ({max_steps} steps max)...")
+    
+    successful_trials = 0
+    
+    for trial in range(num_trials):
+        # Reset environment
+        grid = [[-1 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
+        
+        # Reset all agents to start at B
+        for agent in agents:
+            agent.reset_at_b()
+            grid[agent.pos[0]][agent.pos[1]] = agent.idx
+        
+        # Track if this trial had any collisions
+        collision_occurred = False
+        # Track if agents completed a delivery in this trial
+        delivery_completed = [False] * NUM_AGENTS
+        
+        # Run the trial for max_steps steps
+        for step in range(max_steps):
+            for agent_idx, agent in enumerate(agents):
+                # Get state and choose action (no exploration during evaluation)
+                state = agent.get_state(grid, agents)
+                action = agent.choose_action(grid, agents, eval_mode=True)
+                
+                # Clear agent's current position in grid
+                grid[agent.pos[0]][agent.pos[1]] = -1
+                
+                # Execute move
+                agent.move(action)
+                
+                # Check for delivery completion: B→A→B cycle
+                if agent.pos == A_LOCATION and not agent.carrying:
+                    agent.carrying = True  # Pick up at A
+                elif agent.pos == B_LOCATION and agent.carrying:
+                    agent.carrying = False  # Deliver at B
+                    delivery_completed[agent_idx] = True
+                
+                # Check for collisions
+                for other in agents:
+                    if other is not agent and head_on_collision(agent, other):
+                        collision_occurred = True
+                
+                # Update grid with new position
+                grid[agent.pos[0]][agent.pos[1]] = agent.idx
+            
+            # If all agents completed delivery or collision occurred, end trial
+            if all(delivery_completed) or collision_occurred:
+                break
+        
+        # Trial is successful if at least one agent completed delivery and no collisions
+        if any(delivery_completed) and not collision_occurred:
+            successful_trials += 1
+    
+    success_rate = successful_trials / num_trials * 100
+    print(f"Performance results: {successful_trials}/{num_trials} successful trials ({success_rate:.2f}%)")
+    
+    # Check if performance meets requirement (75% success rate)
+    if success_rate >= 75:
+        print("Performance requirement met (≥75% success rate)")
+    else:
+        print("Performance requirement not met (<75% success rate)")
+    
+    return success_rate
+
+# Run evaluation after training
+evaluation_result = evaluate_performance()
+
 # Visualization setup
 fig, ax = plt.subplots()
 
@@ -187,7 +267,7 @@ def draw_grid():
     ax.invert_yaxis()
     ax.text(A_LOCATION[1], A_LOCATION[0], 'A', ha='center', va='center', fontsize=12, color='green')
     ax.text(B_LOCATION[1], B_LOCATION[0], 'B', ha='center', va='center', fontsize=12, color='blue')
-    ax.set_title("Multi-Agent Delivery: A ↔ B", fontsize=14)
+    ax.set_title(f"Multi-Agent Delivery: A ↔ B (Success Rate: {evaluation_result:.1f}%)", fontsize=14)
 
 def update(frame):
     """
@@ -202,7 +282,7 @@ def update(frame):
 
     for agent in agents:  # Round-robin scheduling
         state = agent.get_state(grid, agents)
-        action = agent.choose_action(grid, agents)
+        action = agent.choose_action(grid, agents, eval_mode=True)  # No exploration during visualization
         
         # Clear the agent's position in the grid
         grid[agent.pos[0]][agent.pos[1]] = -1
@@ -222,8 +302,6 @@ def update(frame):
                 reward = -10  # Penalize head-on collision
 
         agent.rewards_log.append(reward)
-        next_state = agent.get_state(grid, agents)
-        agent.update_q(state, action, reward, next_state)
         
         # Update the agent's position in the grid
         grid[agent.pos[0]][agent.pos[1]] = agent.idx
@@ -237,6 +315,10 @@ def update(frame):
         ax.text(agent.pos[1], agent.pos[0] + 0.3, label, ha='center', va='bottom', fontsize=6)
 
     fig.canvas.draw()
+
+# Initialize agents at B for the visualization
+for agent in agents:
+    agent.reset_at_b()
 
 ani = FuncAnimation(fig, update, frames=200, interval=300, repeat=False)
 plt.show()
