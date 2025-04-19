@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import random
 import pickle
+import time
 
 # Environment setup
 GRID_SIZE = 5
@@ -88,9 +89,21 @@ class Agent:
 # Initialize agents
 agents = [Agent(i) for i in range(NUM_AGENTS)]
 
-# Pre-train agents before visualizing
-print("Training agents...")
-for episode in range(200):
+# Training pipeline constraints
+step_budget = 1_500_000
+collision_budget = 4000
+walltime_budget = 600  # 10 minutes in seconds
+start_time = time.time()
+total_steps = 0
+collision_count = 0
+
+def head_on_collision(agent, other):
+    return agent.pos == other.pos and agent.carrying != other.carrying
+
+# Training loop with budgets
+print("Training agents with step/collision/time budget...")
+episode = 0
+while total_steps < step_budget and collision_count < collision_budget and (time.time() - start_time) < walltime_budget:
     grid = [[-1 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
     for agent in agents:
         agent.reset()
@@ -98,26 +111,93 @@ for episode in range(200):
 
     for step in range(20):
         for agent in agents:
+            total_steps += 1
             state = agent.get_state(grid, agents)
             action = agent.choose_action(grid, agents)
+            dx, dy = actions[action]
+            proposed_x = min(max(agent.pos[0] + dx, 0), GRID_SIZE - 1)
+            proposed_y = min(max(agent.pos[1] + dy, 0), GRID_SIZE - 1)
+
+            # Apply penalty if the target cell is occupied by an agent going in the opposite direction
+            occupying_agent_id = grid[proposed_x][proposed_y]
+            if occupying_agent_id != -1:
+                occupying_agent = agents[occupying_agent_id]
+                if occupying_agent.carrying != agent.carrying:
+                    reward = -5  # apply penalty but allow move
+
             old_pos = agent.pos
             agent.move(action)
 
-            reward = 2 if (old_pos == A_LOCATION and agent.pos == B_LOCATION) else 0
+            reward = 1 if (old_pos == A_LOCATION and agent.pos == B_LOCATION) else 0
             for other in agents:
-                if other is not agent and agent.pos == other.pos:
-                    if agent.carrying != other.carrying:
-                        reward = -10
+                if other is not agent and head_on_collision(agent, other):
+                    reward = -10
+                    collision_count += 1
 
             agent.rewards_log.append(reward)
             next_state = agent.get_state(grid, agents)
             agent.update_q(state, action, reward, next_state)
             grid[agent.pos[0]][agent.pos[1]] = agent.idx
 
+    episode += 1
+
+print(f"Training completed: Episodes={episode}, Steps={total_steps}, Collisions={collision_count}, Time Elapsed={time.time() - start_time:.2f}s")
+
+# Evaluate performance after training
+successful_deliveries = 0
+collision_free_runs = 0
+total_evaluation_runs = 100
+max_deliveries = total_evaluation_runs * NUM_AGENTS
+bonus_qualified_episodes = 0
+
+for _ in range(total_evaluation_runs):
+    grid = [[-1 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
+    for agent in agents:
+        agent.reset()
+        grid[agent.pos[0]][agent.pos[1]] = agent.idx
+
+    delivery_success = [False] * NUM_AGENTS
+    local_collisions = 0
+    steps_taken = 0
+
+    for step in range(25):
+        steps_taken += 1
+        for agent in agents:
+            state = agent.get_state(grid, agents)
+            action = np.argmax(agent.q_table[state]) if state in agent.q_table else random.randint(0, 3)
+            dx, dy = actions[action]
+            proposed_x = min(max(agent.pos[0] + dx, 0), GRID_SIZE - 1)
+            proposed_y = min(max(agent.pos[1] + dy, 0), GRID_SIZE - 1)
+
+            occupying_agent_id = grid[proposed_x][proposed_y]
+            if occupying_agent_id != -1:
+                occupying_agent = agents[occupying_agent_id]
+                if occupying_agent.carrying != agent.carrying:
+                    local_collisions += 1
+
+            agent.move(action)
+            if agent.pos == B_LOCATION:
+                delivery_success[agent.idx] = True
+            grid[agent.pos[0]][agent.pos[1]] = agent.idx
+
+    successful_deliveries += sum(delivery_success)
+    if all(delivery_success) and steps_taken <= 20 and local_collisions == 0:
+        bonus_qualified_episodes += 1
+    if local_collisions == 0:
+        collision_free_runs += 1
+
+success_rate = (successful_deliveries / max_deliveries) * 100
+collision_free_rate = (collision_free_runs / total_evaluation_runs) * 100
+bonus_success_rate = (bonus_qualified_episodes / total_evaluation_runs) * 100
+
+print("\n--- Evaluation Results ---")
+print(f"Success Rate (individual deliveries in ≤25 steps): {success_rate:.2f}%")
+print(f"Collision-Free Runs: {collision_free_rate:.2f}%")
+print(f"Bonus Evaluation Success Rate (<20 steps & no collisions): {bonus_success_rate:.2f}%")
+
 # Save trained Q-tables for future use
 with open("q_tables.pkl", "wb") as f:
     pickle.dump([agent.q_table for agent in agents], f)
-
 # Visualization setup
 fig, ax = plt.subplots()
 
@@ -155,9 +235,8 @@ def update(frame):
         reward = 1 if (old_pos == A_LOCATION and agent.pos == B_LOCATION) else 0
 
         for other in agents:
-            if other is not agent and agent.pos == other.pos:
-                if agent.carrying != other.carrying:
-                    reward = -10  # Penalize head-on collision
+            if other is not agent and head_on_collision(agent, other):
+                reward = -10  # Penalize head-on collision
 
         agent.rewards_log.append(reward)
         next_state = agent.get_state(grid, agents)

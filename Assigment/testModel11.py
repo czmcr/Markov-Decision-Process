@@ -5,11 +5,12 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import random
 import pickle
+import time
 
 # Environment setup
 GRID_SIZE = 5
 NUM_AGENTS = 4
-A_LOCATION = (0, 0)
+A_LOCATION = (1, 1)
 B_LOCATION = (4, 4)
 
 # Actions: 0=North, 1=South, 2=West, 3=East
@@ -24,11 +25,12 @@ class Agent:
       - Central clock (update schedule is round-robin)
       - Off-the-job training (start configs defined below)
     """
-    def __init__(self, idx):
+    def __init__(self, idx, shared_q=None):
         self.idx = idx
         self.reset()
-        self.q_table = {}  # Key: (x, y, carrying, neighbors), Value: [Q-values]
-        self.epsilon = 0.1
+        # Use shared Q-table if provided, otherwise create individual Q-table
+        self.q_table = shared_q if shared_q is not None else {}
+        self.epsilon = 0.2
         self.alpha = 0.1
         self.gamma = 0.99
         self.rewards_log = []
@@ -80,17 +82,40 @@ class Agent:
         new_x = min(max(self.pos[0] + dx, 0), GRID_SIZE - 1)
         new_y = min(max(self.pos[1] + dy, 0), GRID_SIZE - 1)
         self.pos = (new_x, new_y)
-        if self.pos == A_LOCATION:
+
+    def update_carrying_status(self):
+        """Updates carrying status based on current position"""
+        # When at A, pickup supply (become carrying)
+        if self.pos == A_LOCATION and not self.carrying:
             self.carrying = True
-        elif self.pos == B_LOCATION:
+            return 1  # Reward for pickup
+        # When at B, deliver supply (become not carrying)
+        elif self.pos == B_LOCATION and self.carrying:
             self.carrying = False
+            return 1  # Reward for delivery
+        return 0  # No reward if no pickup/delivery happened
 
-# Initialize agents
-agents = [Agent(i) for i in range(NUM_AGENTS)]
+# Create a shared Q-table for all agents
+shared_q_table = {}
 
-# Pre-train agents before visualizing
-print("Training agents...")
-for episode in range(200):
+# Initialize agents with shared Q-table
+agents = [Agent(i, shared_q=shared_q_table) for i in range(NUM_AGENTS)]
+
+# Training pipeline constraints
+step_budget = 1_500_000
+collision_budget = 4000
+walltime_budget = 600  # 10 minutes in seconds
+start_time = time.time()
+total_steps = 0
+collision_count = 0
+
+def head_on_collision(agent, other):
+    return agent.pos == other.pos and agent.carrying != other.carrying
+
+# Training loop with budgets
+print("Training agents with step/collision/time budget...")
+episode = 0
+while total_steps < step_budget and collision_count < collision_budget and (time.time() - start_time) < walltime_budget:
     grid = [[-1 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
     for agent in agents:
         agent.reset()
@@ -98,25 +123,53 @@ for episode in range(200):
 
     for step in range(20):
         for agent in agents:
+            total_steps += 1
             state = agent.get_state(grid, agents)
             action = agent.choose_action(grid, agents)
+            dx, dy = actions[action]
+            proposed_x = min(max(agent.pos[0] + dx, 0), GRID_SIZE - 1)
+            proposed_y = min(max(agent.pos[1] + dy, 0), GRID_SIZE - 1)
+
+            # Allow move only if the target cell is empty OR occupied by agents going in the same direction
+            occupying_agent_id = grid[proposed_x][proposed_y]
+            if occupying_agent_id != -1:
+                occupying_agent = agents[occupying_agent_id]
+                if occupying_agent.carrying != agent.carrying:
+                    reward = -1  # discourage illegal move into conflicting traffic
+                    agent.rewards_log.append(reward)
+                    continue
+
+            # Clear the agent's position in the grid
+            grid[agent.pos[0]][agent.pos[1]] = -1
             old_pos = agent.pos
             agent.move(action)
 
-            reward = 2 if (old_pos == A_LOCATION and agent.pos == B_LOCATION) else 0
+            # Initialize reward
+            reward = 0
+            
+            # Add reward for completing pickup or delivery
+            reward += agent.update_carrying_status()
+            
+            # Check for collisions
             for other in agents:
-                if other is not agent and agent.pos == other.pos:
-                    if agent.carrying != other.carrying:
-                        reward = -10
+                if other is not agent and head_on_collision(agent, other):
+                    reward = -10
+                    collision_count += 1
 
             agent.rewards_log.append(reward)
             next_state = agent.get_state(grid, agents)
             agent.update_q(state, action, reward, next_state)
+            
+            # Update the agent's position in the grid
             grid[agent.pos[0]][agent.pos[1]] = agent.idx
+
+    episode += 1
+
+print(f"Training completed: Episodes={episode}, Steps={total_steps}, Collisions={collision_count}, Time Elapsed={time.time() - start_time:.2f}s")
 
 # Save trained Q-tables for future use
 with open("q_tables.pkl", "wb") as f:
-    pickle.dump([agent.q_table for agent in agents], f)
+    pickle.dump([shared_q_table], f)  # Save only the shared Q-table
 
 # Visualization setup
 fig, ax = plt.subplots()
@@ -150,18 +203,29 @@ def update(frame):
     for agent in agents:  # Round-robin scheduling
         state = agent.get_state(grid, agents)
         action = agent.choose_action(grid, agents)
+        
+        # Clear the agent's position in the grid
+        grid[agent.pos[0]][agent.pos[1]] = -1
+        
         old_pos = agent.pos
         agent.move(action)
-        reward = 1 if (old_pos == A_LOCATION and agent.pos == B_LOCATION) else 0
+        
+        # Initialize reward
+        reward = 0
+        
+        # Add reward for completing pickup or delivery
+        reward += agent.update_carrying_status()
 
+        # Check for collisions
         for other in agents:
-            if other is not agent and agent.pos == other.pos:
-                if agent.carrying != other.carrying:
-                    reward = -10  # Penalize head-on collision
+            if other is not agent and head_on_collision(agent, other):
+                reward = -10  # Penalize head-on collision
 
         agent.rewards_log.append(reward)
         next_state = agent.get_state(grid, agents)
         agent.update_q(state, action, reward, next_state)
+        
+        # Update the agent's position in the grid
         grid[agent.pos[0]][agent.pos[1]] = agent.idx
 
     # Plot agent positions

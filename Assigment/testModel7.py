@@ -4,6 +4,16 @@ from matplotlib.animation import FuncAnimation
 import random
 import pickle
 import time
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, load_model, save_model
+from tensorflow.python.keras.layers import Input, Dense
+from tensorflow.keras.optimizers import Adam
+from collections import deque
+
+# Ensure TensorFlow uses appropriate memory management
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
 # Environment setup
 GRID_SIZE = 5
@@ -14,114 +24,180 @@ B_LOCATION = (4, 4)
 # Actions: 0=North, 1=South, 2=West, 3=East
 actions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
-class Agent:
+class ReplayBuffer:
     """
-    Represents an agent in the grid world with a simple Q-table.
-    Each agent learns to move from A to B and back while avoiding head-on collisions.
-    Includes use of:
-      - State of neighboring cells (only considers agents of opposite type)
-      - Central clock (update schedule is round-robin)
-      - Off-the-job training (start configs defined below)
+    Experience replay buffer for DQN training.
+    Stores transitions (state, action, reward, next_state, done) 
+    for experience replay during training.
     """
-    def __init__(self, idx):
+    def __init__(self, capacity=10000):
+        self.buffer = deque(maxlen=capacity)
+    
+    def add(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+    
+    def sample(self, batch_size):
+        """Sample a batch of experiences from the buffer"""
+        batch = random.sample(self.buffer, min(len(self.buffer), batch_size))
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return np.array(states), np.array(actions), np.array(rewards), np.array(next_states), np.array(dones)
+    
+    def size(self):
+        return len(self.buffer)
+
+class DQNAgent:
+    """
+    Deep Q-Network agent for grid world navigation.
+    Uses a neural network to approximate the Q-function.
+    """
+    def __init__(self, idx, state_size, action_size=4):
         self.idx = idx
         self.reset()
-        self.q_table = {}  # Key: (x, y, carrying, neighbors), Value: [Q-values]
-        self.epsilon = 0.2  # Initial exploration rate
-        self.epsilon_min = 0.01  # Minimum exploration rate
-        self.epsilon_decay = 0.9999  # Decay rate for exploration
-        self.alpha = 0.1  # Learning rate
+        self.state_size = state_size
+        self.action_size = action_size
+        
+        # Hyperparameters
         self.gamma = 0.99  # Discount factor
+        self.epsilon = 1.0  # Initial exploration rate
+        self.epsilon_min = 0.01  # Minimum exploration rate
+        self.epsilon_decay = 0.9995  # Decay rate for exploration
+        self.learning_rate = 0.001  # Learning rate
+        
+        # Neural networks (main and target)
+        self.model = self._build_model()
+        self.target_model = self._build_model()
+        self.update_target_model()  # Initialize target network
+        
+        # Experience replay buffer
+        self.memory = ReplayBuffer(capacity=5000)
+        self.batch_size = 32
+        
+        # Performance tracking
         self.rewards_log = []
-        self.deliveries = 0  # Track number of successful deliveries
-        self.step_count = 0  # Track steps taken
-
+        self.deliveries = 0
+        self.step_count = 0
+        self.update_counter = 0
+        self.target_update_freq = 100  # Update target network every 100 steps
+    
+    def _build_model(self):
+        """Build a neural network for Q-function approximation"""
+        model = Sequential([
+            Input(shape=(self.state_size,)),
+            Dense(64, activation='relu'),
+            Dense(64, activation='relu'),
+            Dense(self.action_size, activation='linear')
+        ])
+        model.compile(loss='mse', optimizer=Adam(learning_rate=self.learning_rate))
+        return model
+    
+    def update_target_model(self):
+        """Update target network with weights from main network"""
+        self.target_model.set_weights(self.model.get_weights())
+    
     def reset(self):
         """Sets initial position and carrying status for off-the-job training."""
         self.pos = A_LOCATION if self.idx % 2 == 0 else B_LOCATION
         self.carrying = self.pos == A_LOCATION
+    
+    def get_state_vector(self, grid, agents):
+        """
+        Convert the agent's state into a vector representation for the neural network.
+        """
+        # Agent's position (normalized)
+        pos_x = self.pos[0] / (GRID_SIZE - 1)
+        pos_y = self.pos[1] / (GRID_SIZE - 1)
         
-    def get_neighbors_state(self, grid, agents):
-        """
-        Returns a binary string where 1 means an adjacent cell has an agent
-        of opposite carrying state (e.g., one is carrying and the other is not).
-        Improved to check diagonals as well (8-neighborhood).
-        """
-        # Check all 8 adjacent cells (N, NE, E, SE, S, SW, W, NW)
+        # Carrying state (0 or 1)
+        carrying = 1.0 if self.carrying else 0.0
+        
+        # Target location (A or B depending on carrying state)
+        target = B_LOCATION if self.carrying else A_LOCATION
+        target_x = target[0] / (GRID_SIZE - 1)
+        target_y = target[1] / (GRID_SIZE - 1)
+        
+        # Direction to target (normalized)
+        dir_x = (target[0] - self.pos[0]) / GRID_SIZE
+        dir_y = (target[1] - self.pos[1]) / GRID_SIZE
+        
+        # Distance to target (normalized)
+        dist_x = abs(target[0] - self.pos[0]) / GRID_SIZE
+        dist_y = abs(target[1] - self.pos[1]) / GRID_SIZE
+        
+        # Neighboring agents' info (check all 8 directions)
         directions = [(-1, 0), (-1, 1), (0, 1), (1, 1), 
                       (1, 0), (1, -1), (0, -1), (-1, -1)]
-        bits = ''
+        
+        neighbor_features = []
         for dx, dy in directions:
             nx, ny = self.pos[0] + dx, self.pos[1] + dy
             if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE:
                 agent_id = grid[nx][ny]
                 if agent_id != -1:
                     other_agent = agents[agent_id]
-                    if other_agent.carrying != self.carrying:
-                        bits += '1'
-                        continue
-            bits += '0'
-        return bits
-
-    def get_state(self, grid, agents):
-        """Enhanced state representation including distance vectors to targets."""
-        neighbors = self.get_neighbors_state(grid, agents)
-        
-        # Add distance to target (A if not carrying, B if carrying)
-        target = B_LOCATION if self.carrying else A_LOCATION
-        distance_x = target[0] - self.pos[0]
-        distance_y = target[1] - self.pos[1]
-        
-        # Limit the range to keep the state space manageable
-        distance_x = max(-2, min(2, distance_x))
-        distance_y = max(-2, min(2, distance_y))
-        
-        return (self.pos[0], self.pos[1], int(self.carrying), neighbors, distance_x, distance_y)
-
-    def choose_action(self, grid, agents, training=True):
-        state = self.get_state(grid, agents)
-        
-        # During training, use epsilon-greedy with decaying epsilon
-        if training and (random.random() < self.epsilon or state not in self.q_table):
-            return random.randint(0, 3)
-        
-        # If state not in Q-table, initialize it with optimistic values
-        if state not in self.q_table:
-            self.q_table[state] = [0.1] * 4  # Slight optimism to encourage exploration
-            
-            # Add a slight bias toward the target
-            target = B_LOCATION if self.carrying else A_LOCATION
-            dx = target[0] - self.pos[0]
-            dy = target[1] - self.pos[1]
-            
-            # Add small bias for actions toward target
-            if dx > 0:  # Target is to the south
-                self.q_table[state][1] += 0.05
-            elif dx < 0:  # Target is to the north
-                self.q_table[state][0] += 0.05
-            if dy > 0:  # Target is to the east
-                self.q_table[state][3] += 0.05
-            elif dy < 0:  # Target is to the west
-                self.q_table[state][2] += 0.05
+                    # 1 if opposite carrying state, 0 otherwise
+                    opposite_type = 1.0 if other_agent.carrying != self.carrying else 0.0
+                    neighbor_features.append(opposite_type)
+                else:
+                    neighbor_features.append(0.0)  # No agent
+            else:
+                neighbor_features.append(-1.0)  # Wall
                 
-        return int(np.argmax(self.q_table[state]))
-
-    def update_q(self, prev_state, action, reward, next_state):
-        if prev_state not in self.q_table:
-            self.q_table[prev_state] = [0.0] * 4
-        if next_state not in self.q_table:
-            self.q_table[next_state] = [0.0] * 4
-            
-        # Q-learning update rule
-        max_next = max(self.q_table[next_state])
-        self.q_table[prev_state][action] += self.alpha * (
-            reward + self.gamma * max_next - self.q_table[prev_state][action]
-        )
+        # Location flags (special positions)
+        at_A = 1.0 if self.pos == A_LOCATION else 0.0
+        at_B = 1.0 if self.pos == B_LOCATION else 0.0
         
-        # Decay exploration rate
+        # Combine all features
+        state = [pos_x, pos_y, carrying, 
+                 target_x, target_y, dir_x, dir_y, 
+                 dist_x, dist_y, at_A, at_B] + neighbor_features
+                 
+        return np.array(state)
+    
+    def choose_action(self, grid, agents, training=True):
+        state = self.get_state_vector(grid, agents)
+        
+        # Epsilon-greedy policy
+        if training and random.random() < self.epsilon:
+            return random.randint(0, self.action_size - 1)
+        
+        # Use model for prediction
+        state_tensor = np.reshape(state, (1, self.state_size))
+        q_values = self.model.predict(state_tensor, verbose=0)[0]
+        return np.argmax(q_values)
+    
+    def remember(self, state, action, reward, next_state, done):
+        """Store experience in replay buffer"""
+        self.memory.add(state, action, reward, next_state, done)
+    
+    def replay(self):
+        """Train model using experience replay"""
+        if self.memory.size() < self.batch_size:
+            return
+        
+        # Sample batch from replay buffer
+        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
+        
+        # Get target Q values from target model
+        target_q = self.target_model.predict(next_states, verbose=0)
+        targets = rewards + self.gamma * np.max(target_q, axis=1) * (1 - dones)
+        
+        # Get current Q values and update targets for actions taken
+        target_f = self.model.predict(states, verbose=0)
+        for i, action in enumerate(actions):
+            target_f[i][action] = targets[i]
+        
+        # Train the model
+        self.model.fit(states, target_f, epochs=1, verbose=0)
+        
+        # Update target network if needed
+        self.update_counter += 1
+        if self.update_counter % self.target_update_freq == 0:
+            self.update_target_model()
+        
+        # Decay epsilon
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
-
+    
     def move(self, action, grid):
         """Move agent and handle collision detection."""
         dx, dy = actions[action]
@@ -145,9 +221,29 @@ class Agent:
             
         self.step_count += 1
         return old_pos, old_carrying
+    
+    def save(self, filepath):
+        """Save the trained model"""
+        save_model(self.model, f"{filepath}_agent{self.idx}.h5")
+    
+    def load(self, filepath):
+        """Load a trained model"""
+        self.model = load_model(f"{filepath}_agent{self.idx}.h5")
+        self.update_target_model()
+
+def head_on_collision(agent, other):
+    """Check if two agents have a head-on collision."""
+    return agent.pos == other.pos and agent.carrying != other.carrying
+
+def calculate_state_size():
+    """Calculate the dimension of the state vector"""
+    # Position (2) + carrying (1) + target location (2) + direction to target (2) + 
+    # distance to target (2) + at A/B flags (2) + 8 neighboring cells
+    return 2 + 1 + 2 + 2 + 2 + 2 + 8
 
 # Initialize agents
-agents = [Agent(i) for i in range(NUM_AGENTS)]
+state_size = calculate_state_size()
+agents = [DQNAgent(i, state_size) for i in range(NUM_AGENTS)]
 
 # Training settings
 max_episodes = 10000
@@ -156,28 +252,22 @@ step_budget = 1_500_000
 collision_budget = 4000
 walltime_budget = 600  # 10 minutes in seconds
 
-def head_on_collision(agent, other):
-    """Check if two agents have a head-on collision."""
-    return agent.pos == other.pos and agent.carrying != other.carrying
-
-# Improved training loop with monitoring
 def train_agents():
-    """Train the agents with a more structured approach."""
+    """Train the agents using DQN with experience replay"""
     start_time = time.time()
     total_steps = 0
     collision_count = 0
     episode = 0
     
     # For monitoring progress
-    eval_interval = 500
+    eval_interval = 100
     rewards_history = []
     collision_history = []
     success_rate_history = []
     
-    print("Training agents with step/collision/time budget...")
+    print("Training agents with DQN and step/collision/time budget...")
     
     # Create a schedule for off-the-job training
-    # We'll use different starting positions to help agents learn various scenarios
     training_schedules = [
         # Schedule 1: All agents start at their default positions
         lambda: [agent.reset() for agent in agents],
@@ -219,8 +309,8 @@ def train_agents():
                     
                 total_steps += 1
                 
-                # Get current state
-                state = agent.get_state(grid, agents)
+                # Get current state vector
+                state = agent.get_state_vector(grid, agents)
                 
                 # Choose and perform action
                 action = agent.choose_action(grid, agents, training=True)
@@ -236,6 +326,7 @@ def train_agents():
                 
                 # Calculate reward
                 reward = 0
+                done = False
                 
                 # Reward for successful delivery
                 if old_pos == A_LOCATION and agent.pos != A_LOCATION and old_carrying:
@@ -251,6 +342,7 @@ def train_agents():
                 # Even larger reward for completing a cycle (B→A→B)
                 if not old_carrying and agent.pos == A_LOCATION:
                     reward += 1.5
+                    done = True  # Consider a completed cycle as a terminal state
                 
                 # Check for collisions
                 for other in agents:
@@ -258,15 +350,19 @@ def train_agents():
                         reward -= 10.0  # Strong penalty for collision
                         collision_count += 1
                         episode_collisions += 1
+                        done = True  # Consider a collision as a terminal state
                 
                 # Small penalty for each step to encourage efficiency
                 reward -= 0.01
                 
                 # Get new state
-                next_state = agent.get_state(grid, agents)
+                next_state = agent.get_state_vector(grid, agents)
                 
-                # Update Q-table
-                agent.update_q(state, action, reward, next_state)
+                # Store experience in replay buffer
+                agent.remember(state, action, reward, next_state, done)
+                
+                # Learn from past experiences
+                agent.replay()
                 
                 # Track rewards
                 agent.rewards_log.append(reward)
@@ -283,9 +379,10 @@ def train_agents():
             success_rate_history.append(success_rate)
             
             elapsed_time = time.time() - start_time
+            avg_epsilon = sum(agent.epsilon for agent in agents) / NUM_AGENTS
             print(f"Episode {episode}: Steps={total_steps}, Collisions={collision_count}, "
                   f"Time={elapsed_time:.1f}s, Success Rate={success_rate:.1f}%, "
-                  f"Avg Reward={rewards_history[-1]:.2f}")
+                  f"Epsilon={avg_epsilon:.3f}, Avg Reward={rewards_history[-1]:.2f}")
     
     # Final statistics
     elapsed_time = time.time() - start_time
@@ -327,7 +424,7 @@ def plot_learning_curves(rewards, collisions, success_rates, eval_interval):
     ax3.grid(True)
     
     plt.tight_layout()
-    plt.savefig('learning_curves.png')
+    plt.savefig('dqn_learning_curves.png')
     plt.show()
 
 def evaluate_agents(num_runs=100, silent=False):
@@ -354,21 +451,12 @@ def evaluate_agents(num_runs=100, silent=False):
             
             for agent in agents:
                 # Get current state
-                state = agent.get_state(grid, agents)
+                state = agent.get_state_vector(grid, agents)
                 
                 # Choose action (no exploration during evaluation)
-                if state in agent.q_table:
-                    action = np.argmax(agent.q_table[state])
-                else:
-                    # If state not seen during training, use a simple heuristic
-                    target = B_LOCATION if agent.carrying else A_LOCATION
-                    dx = target[0] - agent.pos[0]
-                    dy = target[1] - agent.pos[1]
-                    
-                    if abs(dx) > abs(dy):
-                        action = 1 if dx > 0 else 0  # South or North
-                    else:
-                        action = 3 if dy > 0 else 2  # East or West
+                state_tensor = np.reshape(state, (1, state_size))
+                q_values = agent.model.predict(state_tensor, verbose=0)[0]
+                action = np.argmax(q_values)
                 
                 # Clear old position
                 grid[agent.pos[0]][agent.pos[1]] = -1
@@ -386,7 +474,7 @@ def evaluate_agents(num_runs=100, silent=False):
                 
                 # Check for collisions
                 for other in agents:
-                    if other is not agent and head_on_collision(agent, other):
+                    if other.idx != agent.idx and head_on_collision(agent, other):
                         local_collisions += 1
         
         if all(delivery_success) and steps_taken <= 25:
@@ -410,9 +498,9 @@ total_steps, collision_count, elapsed_time = train_agents()
 # Final evaluation
 success_rate = evaluate_agents(num_runs=100)
 
-# Save trained Q-tables for future use
-with open("q_tables.pkl", "wb") as f:
-    pickle.dump([agent.q_table for agent in agents], f)
+# Save trained models
+for agent in agents:
+    agent.save("dqn_model")
 
 # Visualization setup
 fig, ax = plt.subplots(figsize=(8, 8))
@@ -435,7 +523,7 @@ def draw_grid():
 def update(frame):
     """
     Updates the grid visualization and performs one step for each agent.
-    Uses trained Q-tables for decision making.
+    Uses trained DQN models for decision making.
     """
     draw_grid()
     grid = [[-1 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
@@ -443,8 +531,13 @@ def update(frame):
         grid[agent.pos[0]][agent.pos[1]] = agent.idx
 
     for agent in agents:  # Round-robin scheduling
-        state = agent.get_state(grid, agents)
-        action = agent.choose_action(grid, agents, training=False)
+        # Get current state
+        state = agent.get_state_vector(grid, agents)
+        
+        # Choose action using trained model
+        state_tensor = np.reshape(state, (1, state_size))
+        q_values = agent.model.predict(state_tensor, verbose=0)[0]
+        action = np.argmax(q_values)
         
         # Clear old position
         grid[agent.pos[0]][agent.pos[1]] = -1
