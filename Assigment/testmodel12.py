@@ -31,7 +31,7 @@ class Agent:
         # Use shared Q-table if provided, otherwise create individual Q-table
         self.q_table = shared_q if shared_q is not None else {}
         self.epsilon = 0.2
-        self.alpha = 0.1
+        self.alpha = 1e-3
         self.gamma = 0.99
         self.rewards_log = []
 
